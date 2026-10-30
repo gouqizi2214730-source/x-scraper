@@ -49,4 +49,4 @@ python x_scraper.py --cookie cookies.json
 
 ## 自行编译 exe
 
-推送 `v*` 标签（如 `git tag v1.0.0 && git push --tags`），GitHub Actions 会在 Windows 上用 PyInstaller 编译并发布到 Releases。也可以在 Actions 页面手动运行 “Build Windows exe”。
+修改 `VERSION` 里的版本号（如 `1.0.1`）并推送到 main，GitHub Actions 会在 Windows 上用 PyInstaller 编译 exe，并以 `v版本号` 发布到 Releases（同一版本号重复推送会覆盖该 Release 的 exe）。也可以在 Actions 页面手动运行 “Build Windows exe”。

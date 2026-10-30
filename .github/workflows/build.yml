@@ -2,7 +2,8 @@ name: Build Windows exe
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths: ["x_scraper.py", "requirements.txt", "VERSION", ".github/workflows/build.yml"]
   workflow_dispatch:
 
 permissions:
@@ -26,9 +27,15 @@ jobs:
         with:
           name: XScraper-windows
           path: dist/XScraper.exe
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "v=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.v }}
+          name: XScraper v${{ steps.ver.outputs.v }}
+          target_commitish: ${{ github.sha }}
           files: dist/XScraper.exe
           generate_release_notes: true
