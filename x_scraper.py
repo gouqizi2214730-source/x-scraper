@@ -93,8 +93,9 @@ def ask_date(prompt, default):
 # ───────────────────────── Cookie ─────────────────────────
 def parse_cookies(src):
     """src 可以是文件路径或 cookie 字符串，返回 Playwright cookie 列表。"""
-    p = Path(src).expanduser()
-    text = p.read_text(encoding="utf-8") if p.is_file() else src
+    src = src.strip()
+    p = Path(src.strip('"').strip("'")).expanduser()
+    text = p.read_text(encoding="utf-8-sig") if len(src) < 500 and "\n" not in src and p.is_file() else src
     text = text.strip()
     pairs = []  # (name, value, extra)
 
@@ -107,13 +108,15 @@ def parse_cookies(src):
             if "x.com" not in dom and "twitter.com" not in dom:
                 continue
             pairs.append((c["name"], c["value"], c))
-    elif "\t" in text:  # Netscape cookies.txt
+    elif "\t" in text or text.startswith("#") or re.search(r"^\S+\s+(TRUE|FALSE)\s+/", text, re.M):
+        # Netscape cookies.txt（控制台粘贴时 Tab 可能变成空格，两种都兼容）
         for line in text.splitlines():
-            if line.startswith("#") and not line.startswith("#HttpOnly_"):
+            line = line.strip()
+            if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
                 continue
-            parts = line.split("\t")
+            parts = line.split("\t") if "\t" in line else line.split(None, 6)
             if len(parts) == 7 and ("x.com" in parts[0] or "twitter.com" in parts[0]):
-                pairs.append((parts[5], parts[6].strip(), {}))
+                pairs.append((parts[5], parts[6].strip(), {"httpOnly": parts[0].startswith("#HttpOnly_")}))
     else:  # "a=b; c=d"
         for kv in text.split(";"):
             if "=" in kv:
@@ -660,6 +663,72 @@ def interactive_config(prev=None):
     return cfg
 
 
+def read_cookie_input():
+    """读取 cookie：文件路径、单行 cookie 字符串，或直接粘贴的多行 cookies.txt / JSON（以空行结束）。"""
+    print("\ncookie：输入文件路径（可把文件拖进窗口），或粘贴 auth_token=...; ct0=...，")
+    print("        也可以直接粘贴整个 cookies.txt / JSON 内容，粘贴完再按一次回车")
+    first = input("cookie [cookies.json]: ").strip()
+    if not first:
+        return "cookies.json"
+    if Path(first.strip('"').strip("'")).expanduser().is_file():
+        return first.strip('"').strip("'")
+    multi = first.startswith(("#", "[", "{")) or "\t" in first
+    if not multi:
+        return first
+    lines = [first]
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line.strip():
+            # cookies.txt 文件头注释后的空行不算结束
+            if not any(l.strip() and not l.lstrip().startswith("#") for l in lines):
+                continue
+            # JSON 未结束时空行不算结束
+            if lines[0].lstrip().startswith(("[", "{")):
+                try:
+                    json.loads("\n".join(lines))
+                except ValueError:
+                    continue
+            break
+        lines.append(line)
+        if lines[0].lstrip().startswith(("[", "{")):
+            try:
+                json.loads("\n".join(lines))
+                break
+            except ValueError:
+                pass
+    print(f"  已读取 {len(lines)} 行")
+    return "\n".join(lines)
+
+
+def load_cookies(src):
+    try:
+        cookies = parse_cookies(src)
+    except Exception as e:
+        print(f"  读取 cookie 失败：{e}")
+        return None
+    if not cookies:
+        print("  没有读到任何 x.com 的 cookie")
+        return None
+    names = {c["name"] for c in cookies}
+    if {"auth_token", "ct0"} <= names:
+        print(f"  ✓ 读到 {len(cookies)} 个 x.com cookie（含 auth_token、ct0）")
+        return cookies
+    return cookies if ask_bool("缺少 auth_token/ct0，仍然继续", False) else None
+
+
+def drain_stdin():
+    """清掉粘贴时残留在输入缓冲里的内容，避免最后的“按回车退出”被直接触发。"""
+    try:
+        import msvcrt
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    except Exception:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser(description="X 博主帖子抓取器")
     ap.add_argument("--config", help="复用之前保存的 config.json")
@@ -672,15 +741,13 @@ def main():
     else:
         cfg = interactive_config(prev)
 
-    cookie_src = args.cookie or ask("\ncookie 文件路径（或直接粘贴 auth_token=...; ct0=...）", "cookies.json")
-    try:
-        cookies = parse_cookies(cookie_src)
-    except Exception as e:
-        sys.exit(f"读取 cookie 失败：{e}")
-    if not cookies:
-        sys.exit("没有读到任何 x.com 的 cookie")
-    if not {"auth_token", "ct0"} <= {c["name"] for c in cookies} and not ask_bool("仍然继续", False):
-        sys.exit("已退出")
+    cookies = None
+    if args.cookie:
+        cookies = load_cookies(args.cookie)
+    while not cookies:
+        cookies = load_cookies(read_cookie_input())
+        if not cookies:
+            print("  请重新输入（也可以把 cookies.json / cookies.txt 文件直接拖进这个窗口再回车）\n")
 
     out = Path(cfg["out_dir"]).expanduser()
     out.mkdir(parents=True, exist_ok=True)
@@ -735,4 +802,5 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
     if getattr(sys, "frozen", False):
+        drain_stdin()
         input("\n按回车键退出…")
