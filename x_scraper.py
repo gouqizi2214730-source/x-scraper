@@ -329,7 +329,7 @@ async def handle_retry(page, wait=60):
 async def scroll_collect(page, store, user, label, cfg, max_scrolls=400):
     w = cfg_waits(cfg)
     max_stall = w["max_stall"]
-    last, stall = store.count(user), 0
+    last, stall, retries = store.count(user), 0, 0
     for _ in range(max_scrolls):
         await page.evaluate("window.scrollBy(0, -700)")
         await asyncio.sleep(0.3)
@@ -341,8 +341,12 @@ async def scroll_collect(page, store, user, label, cfg, max_scrolls=400):
             last, stall = n, 0
         else:
             stall += 1
-            if await handle_retry(page, w["retry_wait"]):
-                stall = 0
+            if retries < 3 and await handle_retry(page, w["retry_wait"]):
+                retries += 1
+                stall = max(0, max_stall - 2)  # 重试后再试两次滚动，没有新帖就进入下一段
+            elif retries >= 3 and stall >= 2:
+                print("\n  重试 3 次仍没有新内容，跳到下一段（之后可用“继续抓取”补抓）")
+                break
             elif stall >= max_stall or (stall >= 2 and await page.locator(
                     '[data-testid="empty_state_header_text"]').count()):
                 break
@@ -557,8 +561,21 @@ def hard_breaks(text):
     return "\n".join(line + "  " if line.strip() else "" for line in text.split("\n"))
 
 
+def get_tz(name):
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        m = re.match(r"^(?:UTC|GMT)?([+-]\d{1,2})(?::?(\d{2}))?$", name.strip())
+        if m:
+            h = int(m.group(1))
+            return dt.timezone(dt.timedelta(hours=h, minutes=int(m.group(2) or 0) * (1 if h >= 0 else -1)))
+        fixed = {"Asia/Shanghai": 8, "Asia/Hong_Kong": 8, "Asia/Taipei": 8, "Asia/Singapore": 8,
+                 "Asia/Tokyo": 9, "UTC": 0, "Europe/London": 0}
+        return dt.timezone(dt.timedelta(hours=fixed.get(name, 8)))
+
+
 def render(cfg, posts, all_posts, img_ref):
-    tz = ZoneInfo(cfg["timezone"]) if ZoneInfo else dt.timezone(dt.timedelta(hours=8))
+    tz = get_tz(cfg.get("timezone", "Asia/Shanghai"))
     img = lambda u: img_ref.get(u, u)
     out = [f"# @{cfg['user']} 帖子合集", ""]
     out.append(f"> 抓取于 {dt.datetime.now(tz):%Y-%m-%d %H:%M}（{cfg['timezone']}） · 共 {len(posts)} 条  ")
@@ -735,27 +752,48 @@ def main():
     ap.add_argument("--cookie", help="cookie 文件路径或字符串")
     args = ap.parse_args()
 
+    if not args.config:
+        found = sorted(Path(".").glob("x_*/config.json"))
+        if found:
+            print("\n发现之前的抓取：")
+            for k, f in enumerate(found, 1):
+                n = 0
+                try:
+                    n = len(json.loads((f.parent / "posts.json").read_text(encoding="utf-8")))
+                except Exception:
+                    pass
+                print(f"  {k}. {f.parent}（已有 {n} 条数据）")
+            v = ask("输入编号使用它，直接回车开始新的抓取", "")
+            if v.isdigit() and 1 <= int(v) <= len(found):
+                args.config = str(found[int(v) - 1])
     prev = json.loads(Path(args.config).read_text(encoding="utf-8")) if args.config else None
     if prev and ask_bool(f"复用 {args.config} 的设置直接开始", True):
         cfg = prev
     else:
         cfg = interactive_config(prev)
 
+    out = Path(cfg["out_dir"]).expanduser()
+    offline = False
+    if (out / "posts.json").exists():
+        v = ask(f"\n{out} 里已有抓取数据：1=继续抓取并合并  2=不抓取，只用已有数据生成 md", "1")
+        offline = v == "2"
+
     cookies = None
-    if args.cookie:
+    if offline:
+        cookies = []
+    elif args.cookie:
         cookies = load_cookies(args.cookie)
-    while not cookies:
+    while cookies is None or (not offline and not cookies):
         cookies = load_cookies(read_cookie_input())
         if not cookies:
             print("  请重新输入（也可以把 cookies.json / cookies.txt 文件直接拖进这个窗口再回车）\n")
 
-    out = Path(cfg["out_dir"]).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     store = Store(out / "posts.json")
 
     try:
-        ok = asyncio.run(scrape(cfg, cookies, store))
+        ok = True if offline else asyncio.run(scrape(cfg, cookies, store))
     except KeyboardInterrupt:
         print("\n已中断，已抓到的数据会保留，下次在同一输出目录运行即可继续。")
         store.save()

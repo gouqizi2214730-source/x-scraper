@@ -22,7 +22,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
       - name: Build exe
-        run: pyinstaller --onefile --console --name XScraper --collect-all playwright x_scraper.py
+        run: pyinstaller --onefile --console --name XScraper --collect-all playwright --collect-data tzdata x_scraper.py
       - uses: actions/upload-artifact@v4
         with:
           name: XScraper-windows
