@@ -273,11 +273,11 @@ def date_slices(since, until, days):
         a = b
 
 
-WAIT_DEFAULTS = {"scroll_min": 1.8, "scroll_max": 3.2, "slice_wait": 5, "retry_wait": 60, "max_stall": 5}
+WAIT_DEFAULTS = {"scroll_min": 1.8, "scroll_max": 3.2, "slice_wait": 5, "retry_wait": 60, "max_stall": 5, "max_retries": 0}
 WAIT_PRESETS = {
-    "1": {"scroll_min": 1.2, "scroll_max": 2.0, "slice_wait": 2, "retry_wait": 45, "max_stall": 4},
+    "1": {"scroll_min": 1.2, "scroll_max": 2.0, "slice_wait": 2, "retry_wait": 45, "max_stall": 4, "max_retries": 0},
     "2": WAIT_DEFAULTS,
-    "3": {"scroll_min": 3.5, "scroll_max": 6.0, "slice_wait": 20, "retry_wait": 120, "max_stall": 6},
+    "3": {"scroll_min": 3.5, "scroll_max": 6.0, "slice_wait": 20, "retry_wait": 120, "max_stall": 6, "max_retries": 0},
 }
 
 
@@ -311,46 +311,67 @@ async def launch_browser(pw, headless):
         return None
 
 
-async def handle_retry(page, wait=60):
-    btn = page.locator('[role="button"]:has-text("Retry"), [role="button"]:has-text("重试"), '
-                       'button:has-text("Retry"), button:has-text("重试")')
+RETRY_SEL = ('[role="button"]:has-text("Retry"), [role="button"]:has-text("重试"), '
+             'button:has-text("Retry"), button:has-text("重试")')
+
+
+def backoff(base, attempt):
+    """第 n 次重试的等待秒数：base, 2base, 4base…… 最长 15 分钟"""
+    return min(base * (2 ** attempt), 900)
+
+
+async def handle_retry(page, base=60, attempt=0):
+    btn = page.locator(RETRY_SEL)
     if await btn.count():
-        print(f"\n  页面加载失败（可能被限流），等待 {wait} 秒后重试…")
+        wait = backoff(base, attempt)
+        until = (dt.datetime.now() + dt.timedelta(seconds=wait)).strftime("%H:%M:%S")
+        print(f"\n  页面加载失败（多半是被限流），第 {attempt + 1} 次重试，等待 {wait:.0f} 秒（约 {until}）…")
         await asyncio.sleep(wait)
-        try:
-            await btn.first.click()
-        except Exception:
-            pass
+        if attempt % 3 == 2:  # 连续失败多次就整页刷新
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                pass
+        else:
+            try:
+                await btn.first.click()
+            except Exception:
+                pass
         await asyncio.sleep(5)
         return True
     return False
 
 
-async def scroll_collect(page, store, user, label, cfg, max_scrolls=400):
+async def scroll_collect(page, store, user, label, cfg):
     w = cfg_waits(cfg)
     max_stall = w["max_stall"]
     last, stall, retries = store.count(user), 0, 0
-    for _ in range(max_scrolls):
-        await page.evaluate("window.scrollBy(0, -700)")
-        await asyncio.sleep(0.3)
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    while True:
+        try:
+            await page.evaluate("window.scrollBy(0, -700)")
+            await asyncio.sleep(0.3)
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            await asyncio.sleep(3)  # 页面正在刷新/跳转
+            continue
         await asyncio.sleep(random.uniform(w["scroll_min"], w["scroll_max"]))
         n = store.count(user)
         print(f"\r  {label}：累计 {n} 条", end="", flush=True)
         if n > last:
-            last, stall = n, 0
+            last, stall, retries = n, 0, 0
         else:
             stall += 1
-            if retries < 3 and await handle_retry(page, w["retry_wait"]):
+            if w["max_retries"] and retries >= w["max_retries"] and await page.locator(RETRY_SEL).count():
+                print(f"\n  已重试 {retries} 次仍失败，跳过本段（之后选“继续抓取”可补抓）")
+                return False
+            if await handle_retry(page, w["retry_wait"], retries):
                 retries += 1
-                stall = max(0, max_stall - 2)  # 重试后再试两次滚动，没有新帖就进入下一段
-            elif retries >= 3 and stall >= 2:
-                print("\n  重试 3 次仍没有新内容，跳到下一段（之后可用“继续抓取”补抓）")
-                break
+                stall = 0
             elif stall >= max_stall or (stall >= 2 and await page.locator(
                     '[data-testid="empty_state_header_text"]').count()):
                 break
     print()
+    return True
 
 
 async def scrape(cfg, cookies, store):
@@ -399,15 +420,30 @@ async def scrape(cfg, cookies, store):
 
         slices = list(date_slices(cfg["since"], cfg["until"], cfg["slice_days"]))
         tab = "live" if cfg["sort"] == "latest" else "top"
+        skipped = []
         for k, (a, b) in enumerate(slices, 1):
             q = build_query(cfg, a, b)
             url = f"https://x.com/search?q={quote(q)}&src=typed_query&f={tab}"
-            await page.goto(url, wait_until="domcontentloaded")
+            attempt = 0
+            while True:  # 打开搜索页失败（断网/超时）也一直重试
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    break
+                except Exception as e:
+                    wait = backoff(w["retry_wait"], attempt)
+                    print(f"\n  打开搜索页失败（{type(e).__name__}），{wait:.0f} 秒后重试…")
+                    await asyncio.sleep(wait)
+                    attempt += 1
             await asyncio.sleep(random.uniform(3, 5))
-            await scroll_collect(page, store, cfg["user"], f"[{k}/{len(slices)}] {a} ~ {b}", cfg)
+            if not await scroll_collect(page, store, cfg["user"], f"[{k}/{len(slices)}] {a} ~ {b}", cfg):
+                skipped.append(f"{a} ~ {b}")
             if k < len(slices) and w["slice_wait"]:
                 await asyncio.sleep(random.uniform(w["slice_wait"], w["slice_wait"] * 1.5))
             store.save()
+
+        if skipped:
+            print(f"\n⚠ 以下 {len(skipped)} 段因多次重试失败被跳过：{', '.join(skipped)}")
+            print("  可以稍后再运行，选“继续抓取并合并”补抓；或把重试次数设为 0（一直重试）")
 
         if cfg["fetch_articles"]:
             todo = [r for r in store.posts.values()
@@ -667,6 +703,7 @@ def interactive_config(prev=None):
             "slice_wait": ask_float("每个时间段之间额外等待（秒）", b["slice_wait"]),
             "retry_wait": ask_float("遇到限流/加载失败时等待（秒）", b["retry_wait"]),
             "max_stall": ask_int("连续几次滚动没有新帖就结束该时间段", b["max_stall"]),
+            "max_retries": ask_int("限流/加载失败时最多重试几次（0=一直重试直到成功）", b["max_retries"]),
         }
     else:
         cfg["waits"] = dict(WAIT_PRESETS.get(choice, WAIT_DEFAULTS))
